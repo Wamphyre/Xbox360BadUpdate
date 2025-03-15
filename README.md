@@ -1,3 +1,5 @@
+# WORK IN PROGRESS, DON'T USE
+
 # Bad Update Exploit Stability Improvements
 
 This repository contains stability optimizations for the Bad Update exploit for Xbox 360, a software-based hypervisor exploit that works on the latest (17559) dashboard version. These improvements aim to conservatively increase the success rate above the current 30% while maintaining the same core timing mechanisms.
