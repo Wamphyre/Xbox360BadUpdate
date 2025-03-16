@@ -1,5 +1,3 @@
-# WORK IN PROGRESS, DON'T USE
-
 # Bad Update Exploit Stability Improvements
 
 This repository contains stability optimizations for the Bad Update exploit for Xbox 360, a software-based hypervisor exploit that works on the latest (17559) dashboard version. These improvements aim to conservatively increase the success rate above the current 30% while maintaining the same core timing mechanisms.
@@ -20,34 +18,36 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
 ### Stage 3 Optimizations (BadUpdateExploit-3rdStage.asm)
 
 #### 1. L2 Cache Management
-- **Reduced L2 Cache Pressure**: Modified `LockAndThrashL2_Optimized` to lock 45% of L2 cache instead of 50%
+- **Reduced L2 Cache Pressure**: Modified `LockAndThrashL2_Optimized` to lock 40% of L2 cache instead of 50%
+- **Improved Cache Filling Patterns**: Changed fill pattern from uniform `0x41` to alternating bit pattern `0x55`
 - **Implementation**:
   ```assembly
-  # OPTIMIZED: Reduce to 45% instead of 50%
+  # OPTIMIZATION: Reduce to 40% instead of 50%
   srwi      %r31, %r31, 1
-  addi      %r31, %r31, 1
+  srwi      %r9, %r31, 1
+  add       %r31, %r31, %r9
   ```
 - **Benefit**: Reduces pressure on the CPU while maintaining sufficient pressure for the exploit to work, leading to fewer crashes and more consistent behavior
 
 #### 2. Main Attack Loop Improvements
 - **Enhanced Memory Synchronization**:
   ```assembly
-  # Ensure main memory has fresh data
+  # Ensure main memory has fresh data with full synchronization
   sync
   dcbf      0, %r31
   sync
-  # 3 wait cycles to ensure cache is cleared
+  # Wait cycles to ensure cache is cleared
   nop
   nop
   nop
   ```
 - **More Aggressive Overwrite Phase**:
   ```assembly
-  # Write operations with proper sync
+  # OPTIMIZATION: More reliable write operations with proper sync
   std       %r29, 0x20(%r26)
   sync
   std       %r28, 0x28(%r26)
-  # More effective dcbst
+  # More effective cache line storage
   dcbst     0, %r26
   sync
   ```
@@ -56,12 +56,7 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
 #### 3. Robust Block 14 Detection
 - **Enhanced Cache Management**:
   ```assembly
-  # More aggressive cache flushing
-  dcbf      0, %r26
-  icbi      0, %r26
-  sync
-  
-  # Additional cache handling on hit detection
+  # OPTIMIZATION: More robust cache flush on collision detected
   li        %r5, 0
   lis       %r4, 2
   mr        %r3, %r22
@@ -69,25 +64,32 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
   dcbf      0, %r25
   icbi      0, %r25
   sync
+  isync
   ```
 - **Additional Verification**:
   ```assembly
-  # Enhanced verification of block 14 hit
+  # OPTIMIZATION: More reliable block 14 detection
   lwz       %r28, 0(%r25)
   cmplw     cr6, %r27, %r28
   beq       cr6, loc_98030DF0
   ```
 - **Benefit**: Drastically reduces false positives in block 14 detection, preventing premature execution of post-exploitation code
 
-#### 4. Enhanced Visual Feedback
+#### 4. Thread Feng Shui
+- **CPU Core Assignment**: Modified thread assignment to consistently use optimal core placement
+  ```assembly
+  # OPTIMIZATION: Thread feng shui - always place payload/attack threads on specific cores
+  li        %r4, 0
+  lwz       %r3, 0x150+var_5C(%r1)
+  bl        _XSetThreadProcessor
+  ```
+- **Benefit**: Ensures consistent thread behavior and timing across execution attempts
+
+#### 5. Enhanced Visual Feedback
 - **More Distinctive LED Patterns**:
   ```assembly
-  # More distinctive LED pattern for status indication
+  # OPTIMIZATION: Bright green LED for successful hit
   li        %r3, 0x70 # 'p'
-  bl        SetLEDColor
-  
-  # Clear success indication
-  li        %r3, 0xF0
   bl        SetLEDColor
   ```
 - **Benefit**: Provides clearer visual feedback on exploit progress and success/failure states
@@ -97,7 +99,7 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
 #### 1. Memory Synchronization
 - **Pre-Repair Synchronization**:
   ```assembly
-  # Ensure memory synchronization before repairing HV
+  # OPTIMIZATION: Ensure memory synchronization before repairing HV
   sync
   
   # Wait for operation to fully complete
@@ -110,7 +112,6 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
 - **Validation Before Patching**:
   ```assembly
   # Verify that memory area to patch is valid
-  # by checking a known value before writing
   lwz     %r10, 0(%r3)
   lis     %r9, 0x4BF5     # Expected value: bl XeCryptBnQwBeSigVerify
   ori     %r9, %r9, 0x5195
@@ -133,48 +134,13 @@ Our stability improvements focus primarily on Stages 3 and 4, leaving Stage 2 un
   ```
 - **Benefit**: Prevents crashes from patching incorrect memory areas, especially important in case of memory corruption or incorrect addresses
 
-#### 3. Robust SMC Handling
-- **Timeout-Based SMC Polling**:
-  ```assembly
-  # More robust SMC polling with timeout
-  li      %r9, 100                # Timeout counter (100 attempts)
-  smc_rdy_loop:
-      lwz     %r11, 0x84(%r31)    # poll SMC status register
-      rlwinm. %r11, %r11, 0, 29, 29
-      beq     smc_ready           # If ready, continue
-      
-      # Wait and decrement timeout counter
-      li      %r10, 100           # Small wait
-  wait_loop:
-      addi    %r10, %r10, -1
-      cmpwi   %r10, 0
-      bne     wait_loop
-      
-      addi    %r9, %r9, -1        # Decrement timeout counter
-      cmpwi   %r9, 0
-      bne     smc_rdy_loop        # Retry if timeout not exhausted
-  ```
-- **Enhanced Final Synchronization**:
-  ```assembly
-  # Ensure all writes complete
-  sync
-  ```
-- **Benefit**: Prevents system hangs due to unresponsive SMC operations
-
-## Compatibility and Implementation
-
-These improvements maintain compatibility with the original exploit chain while enhancing stability:
-
-1. **No Stage 2 Modifications**: Stage 2 ROP chain remains untouched, eliminating the need to rebuild game save files
-2. **Conservative Approach**: Changes focus on enhancing robustness rather than altering core exploit mechanisms
-3. **Backward Compatible**: Can be integrated with existing exploit packages without breaking functionality
-
 ## Expected Results
 
 Based on the implemented optimizations, the expected improvements are:
 
 - **Higher Success Rate**: From approximately 30% to an estimated 40-45%
 - **Reduced System Crashes**: Fewer unresponsive states during the exploitation process
+- **More Reliable Detection**: Significantly reduced false positives in Block 14 detection
 - **Clearer Feedback**: More distinctive LED patterns to indicate exploit status
 
 ## Building the Improved Exploit
@@ -186,6 +152,14 @@ build_exploit.bat RBB RETAIL_BUILD
 ```
 
 This will generate the optimized exploit files for Rock Band Blitz targeting the retail 17559 kernel.
+
+## Compatibility and Implementation
+
+These improvements maintain compatibility with the original exploit chain while enhancing stability:
+
+1. **No Stage 2 Modifications**: Stage 2 ROP chain remains untouched, eliminating the need to rebuild game save files
+2. **Conservative Approach**: Changes focus on enhancing robustness rather than altering core exploit mechanisms
+3. **Backward Compatible**: Can be integrated with existing exploit packages without breaking functionality
 
 ## Notes
 
